@@ -1,5 +1,5 @@
 from TTS.api import TTS
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Query, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse,StreamingResponse
 
@@ -18,6 +18,9 @@ from uuid import uuid4
 from xtts_api_server.tts_funcs import TTSWrapper,supported_languages,InvalidSettingsError
 from xtts_api_server.RealtimeTTS import TextToAudioStream, CoquiEngine
 from xtts_api_server.modeldownloader import check_stream2sentence_version,install_deepspeed_based_on_python_version
+
+from banglanlptoolkit import BnNLPNormalizer
+import pybangla
 
 # Default Folders , you can change them via API
 DEVICE = os.getenv('DEVICE',"cuda")
@@ -111,6 +114,15 @@ def play_stream(stream,language):
     else:
       stream.play_async()
 
+text_normalizer = BnNLPNormalizer()
+tts_normalizer = pybangla.Normalizer()
+
+def normalize_text(text, language):
+    if language == "bn":
+        text = tts_normalizer.text_normalizer(text, all_operation=True)
+        text = text_normalizer.normalize_bn([text])[0]
+    return text
+
 class OutputFolderRequest(BaseModel):
     output_folder: str
 
@@ -156,12 +168,12 @@ def get_languages():
     languages = XTTS.list_languages()
     return {"languages": languages}
 
-@app.get("/get_folders")
-def get_folders():
-    speaker_folder = XTTS.speaker_folder
-    output_folder = XTTS.output_folder
-    model_folder = XTTS.model_folder
-    return {"speaker_folder": speaker_folder, "output_folder": output_folder,"model_folder":model_folder}
+# @app.get("/get_folders")
+# def get_folders():
+#     speaker_folder = XTTS.speaker_folder
+#     output_folder = XTTS.output_folder
+#     model_folder = XTTS.model_folder
+#     return {"speaker_folder": speaker_folder, "output_folder": output_folder,"model_folder":model_folder}
 
 @app.get("/get_models_list")
 def get_models_list():
@@ -194,32 +206,32 @@ def set_output(output_req: OutputFolderRequest):
         logger.error(e)
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/set_speaker_folder")
-def set_speaker_folder(speaker_req: SpeakerFolderRequest):
-    try:
-        XTTS.set_speaker_folder(speaker_req.speaker_folder)
-        return {"message": f"Speaker folder set to {speaker_req.speaker_folder}"}
-    except ValueError as e:
-        logger.error(e)
-        raise HTTPException(status_code=400, detail=str(e))
+# @app.post("/set_speaker_folder")
+# def set_speaker_folder(speaker_req: SpeakerFolderRequest):
+#     try:
+#         XTTS.set_speaker_folder(speaker_req.speaker_folder)
+#         return {"message": f"Speaker folder set to {speaker_req.speaker_folder}"}
+#     except ValueError as e:
+#         logger.error(e)
+#         raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/switch_model")
-def switch_model(modelReq: ModelNameRequest):
-    try:
-        XTTS.switch_model(modelReq.model_name)
-        return {"message": f"Model switched to {modelReq.model_name}"}
-    except InvalidSettingsError as e:  
-        logger.error(e)
-        raise HTTPException(status_code=400, detail=str(e))
+# @app.post("/switch_model")
+# def switch_model(modelReq: ModelNameRequest):
+#     try:
+#         XTTS.switch_model(modelReq.model_name)
+#         return {"message": f"Model switched to {modelReq.model_name}"}
+#     except InvalidSettingsError as e:  
+#         logger.error(e)
+#         raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/set_tts_settings")
-def set_tts_settings_endpoint(tts_settings_req: TTSSettingsRequest):
-    try:
-        XTTS.set_tts_settings(**tts_settings_req.dict())
-        return {"message": "Settings successfully applied"}
-    except InvalidSettingsError as e: 
-        logger.error(e)
-        raise HTTPException(status_code=400, detail=str(e))
+# @app.post("/set_tts_settings")
+# def set_tts_settings_endpoint(tts_settings_req: TTSSettingsRequest):
+#     try:
+#         XTTS.set_tts_settings(**tts_settings_req.dict())
+#         return {"message": "Settings successfully applied"}
+#     except InvalidSettingsError as e: 
+#         logger.error(e)
+#         raise HTTPException(status_code=400, detail=str(e))
 
 @app.get('/tts_stream')
 async def tts_stream(request: Request, text: str = Query(), speaker_wav: str = Query(), language: str = Query()):
@@ -231,6 +243,8 @@ async def tts_stream(request: Request, text: str = Query(), speaker_wav: str = Q
     if language.lower() not in supported_languages:
         raise HTTPException(status_code=400,
                             detail="Language code sent is either unsupported or misspelled.")
+    
+    text = normalize_text(text, language)
             
     async def generator():
         chunks = XTTS.process_tts_to_file(
@@ -249,6 +263,47 @@ async def tts_stream(request: Request, text: str = Query(), speaker_wav: str = Q
             yield chunk
 
     return StreamingResponse(generator(), media_type='audio/x-wav')
+
+@app.websocket("/tts_stream_ws")
+async def tts_stream_ws(websocket: WebSocket):
+    # Validate local model source.
+    if XTTS.model_source != "local":
+        raise HTTPException(status_code=400,
+                            detail="WebSocket Streaming is only supported for local models.")
+    
+    await websocket.accept()
+    try:
+        while True:
+            data = await websocket.receive_json()
+            text = data.get("text", "")
+            speaker_wav = "reference_male.wav"  # Default speaker wav file
+            language = data.get("language", "")
+
+            # Validate language code against supported languages.
+            if language.lower() not in supported_languages:
+                raise HTTPException(status_code=400,
+                                    detail="Language code sent is either unsupported or misspelled.")
+            
+            text = normalize_text(text, language)
+
+            chunks = XTTS.process_tts_to_file(
+                text=text,
+                speaker_name_or_path=speaker_wav,
+                language=language.lower(),
+                stream=True,
+            )
+            # Write file header to the output stream.
+            await websocket.send_bytes(XTTS.get_wav_header())
+            async for chunk in chunks:
+                await websocket.send_bytes(chunk)
+
+            # close connection after sending all chunks
+            await websocket.send_text("[DONE]")
+            break  # Exit the loop after processing one request
+
+    except Exception as e:
+        logger.error(f"WebSocket error: {str(e)}")
+        await websocket.close(code=1000, reason=str(e))
 
 @app.post("/tts_to_audio/")
 async def tts_to_audio(request: SynthesisRequest, background_tasks: BackgroundTasks):

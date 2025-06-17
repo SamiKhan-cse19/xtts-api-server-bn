@@ -5,3 +5,6 @@ loguru
 pydub
 uvicorn
 git+https://github.com/SamiKhan-cse19/coqui-tts-bn.git
+git+https://github.com/csebuetnlp/normalizer
+banglanlptoolkit
+pybangla
